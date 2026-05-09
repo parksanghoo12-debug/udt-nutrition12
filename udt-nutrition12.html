@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="UDT 식단">
+<meta name="theme-color" content="#16A34A">
+<title>UDT 작전 식단 로그</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🥗</text></svg>">
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+html,body,#root{height:100%;font-family:'Pretendard','Apple SD Gothic Neo','Noto Sans KR',system-ui,sans-serif;}
+body{background:#F7FAF7;color:#111827;overscroll-behavior:none;}
+textarea,input{-webkit-appearance:none;font-family:inherit;}
+::-webkit-scrollbar{display:none;}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes slideUp{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ══════════════════════════════════════════
+   CONFIG
+══════════════════════════════════════════ */
+const GOALS = { cal:3400, prot:175, carb:420, fat:90 };
+const DK = ["일","월","화","수","목","금","토"];
+const fmt = (d=new Date())=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+const TODAY = ()=>fmt();
+const pct = (v,g)=>Math.min(100,Math.round((v/g)*100));
+const MK = d=>`udt_${d}`;
+const TIMES = [
+  {id:"아침",c:"#16A34A",icon:"🌅"},{id:"점심",c:"#0D9488",icon:"☀️"},
+  {id:"저녁",c:"#2563EB",icon:"🌙"},{id:"간식",c:"#7C3AED",icon:"🍎"},
+  {id:"훈련전",c:"#15803D",icon:"⚡"},{id:"훈련후",c:"#DC2626",icon:"🔥"},
+];
+const C = {
+  bg:"#F7FAF7",card:"#fff",bdr:"#DCE8DC",grn:"#16A34A",
+  gl:"#ECFDF5",gb:"#BBF7D0",txt:"#111827",sub:"#6B7280",
+  mut:"#9CA3AF",red:"#DC2626",amb:"#D97706",blu:"#2563EB",pur:"#7C3AED"
+};
+
+/* ══════════════════════════════════════════
+   STORAGE (localStorage — 네이티브 앱처럼 동작)
+══════════════════════════════════════════ */
+const LS = {
+  get: k => { try{return localStorage.getItem(k);}catch{return null;} },
+  set: (k,v) => { try{localStorage.setItem(k,v);return true;}catch{return false;} },
+  del: k => { try{localStorage.removeItem(k);}catch{} },
+};
+
+/* ══════════════════════════════════════════
+   API (직접 브라우저 호출 — CORS 허용 헤더 포함)
+══════════════════════════════════════════ */
+async function callAI(content, apiKey) {
+  if (!apiKey) throw new Error("API 키가 설정되지 않았습니다. 설정 탭에서 입력하세요.");
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{ role:"user", content }],
+    }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || "API 오류");
+  const text = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
+  if (!text) throw new Error("빈 응답");
+  return text;
+}
+
+function mkPrompt(time, food) {
+  return `당신은 UDT 해군특수전 훈련생의 전담 영양 분석 전문가입니다.
+반드시 아래 형식 그대로만 답하세요. 다른 말은 절대 하지 마세요.
+
+name: 식사명 한국어 20자 이내
+calories: 칼로리 숫자만
+protein: 단백질g 숫자만
+carbs: 탄수화물g 숫자만
+fat: 지방g 숫자만
+items: 재료1, 재료2, 재료3
+coach: UDT 훈련 관점 코칭 한 문장
+
+규칙: 한국 식품영양소 데이터베이스 기준. 양 불명확하면 표준 1인분. 숫자는 정수.
+
+시간대: ${time}
+${food ? "식단: "+food : "위 사진의 음식을 분석하세요."}`;
+}
+
+function parseKV(raw) {
+  const lines = raw.split(/\r?\n/);
+  const g = (...ks) => {
+    for (const k of ks) {
+      const l = lines.find(x=>x.toLowerCase().startsWith(k.toLowerCase()+":"));
+      if (l) return l.slice(k.length+1).trim();
+    }
+    return "";
+  };
+  return {
+    name:g("name","식사명")||"식사",
+    cal:Math.abs(parseInt(g("calories","칼로리"))||0),
+    prot:Math.abs(parseInt(g("protein","단백질"))||0),
+    carb:Math.abs(parseInt(g("carbs","탄수화물"))||0),
+    fat:Math.abs(parseInt(g("fat","지방"))||0),
+    items:(g("items","재료")||"").split(",").map(s=>s.trim()).filter(Boolean),
+    coach:g("coach","코칭")||"",
+  };
+}
+
+/* ══════════════════════════════════════════
+   IMAGE COMPRESS
+══════════════════════════════════════════ */
+function compressImg(file) {
+  return new Promise((ok,no)=>{
+    const r=new FileReader();
+    r.onerror=()=>no(new Error("파일 읽기 실패"));
+    r.onload=ev=>{
+      const img=new Image();
+      img.onerror=()=>no(new Error("이미지 로드 실패"));
+      img.onload=()=>{
+        let w=img.width,h=img.height;const M=600;
+        if(w>M||h>M){if(w>=h){h=Math.round(h*M/w);w=M;}else{w=Math.round(w*M/h);h=M;}}
+        const cv=document.createElement("canvas");cv.width=w;cv.height=h;
+        cv.getContext("2d").drawImage(img,0,0,w,h);
+        const url=cv.toDataURL("image/jpeg",0.6);
+        const b64=url.split(",")[1];
+        if(!b64)return no(new Error("압축 실패"));
+        ok({b64,url});
+      };
+      img.src=ev.target.result;
+    };
+    r.readAsDataURL(file);
+  });
+}
+
+/* ══════════════════════════════════════════
+   SMALL COMPONENTS
+══════════════════════════════════════════ */
+function MacroBar({label,value,goal,color,unit}) {
+  const p=pct(value,goal);
+  return (
+    <div style={{marginBottom:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:5}}>
+        <span style={{color:C.sub,fontWeight:600}}>{label}</span>
+        <span><b style={{color:C.txt}}>{Math.round(value)}</b>
+          <span style={{color:C.mut,fontSize:10}}> / {goal}{unit}</span>
+          <span style={{color,fontSize:10,fontWeight:700,marginLeft:6}}>{p}%</span></span>
+      </div>
+      <div style={{height:8,background:C.gl,borderRadius:4,overflow:"hidden"}}>
+        <div style={{width:p+"%",height:"100%",borderRadius:4,
+          background:`linear-gradient(90deg,${color}88,${color})`,
+          transition:"width .5s ease",boxShadow:p>=100?`0 0 8px ${color}66`:"none"}}/>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════
+   MAIN APP
+══════════════════════════════════════════ */
+function App() {
+  const [tab,    setTab]    = useState("log");
+  const [date,   setDate]   = useState(TODAY());
+  const [meals,  setMeals]  = useState([]);
+  const [text,   setText]   = useState("");
+  const [time,   setTime]   = useState("아침");
+  const [busy,   setBusy]   = useState(false);
+  const [bMsg,   setBMsg]   = useState("");
+  const [err,    setErr]    = useState(null);
+  const [prev,   setPrev]   = useState(null);
+  const [openId, setOpenId] = useState(null);
+  const [toast,  setToast]  = useState(null);
+  const [apiKey, setApiKey] = useState(LS.get("udt_apikey")||"");
+  const [keyInput,setKeyInput]=useState(LS.get("udt_apikey")||"");
+  const [wk,     setWk]     = useState({});
+  const [wkBusy, setWkBusy] = useState(false);
+  const [fb,     setFb]     = useState("");
+  const [fbBusy, setFbBusy] = useState(false);
+  const camR=useRef(), galR=useRef();
+
+  const flash = (msg,t="ok")=>{setToast({msg,t});setTimeout(()=>setToast(null),2600);};
+
+  // load meals
+  useEffect(()=>{ const raw=LS.get(MK(date)); try{setMeals(raw?JSON.parse(raw):[]);}catch{setMeals([]);} },[date]);
+
+  // save meals
+  const save = useCallback((d,data)=>{
+    LS.set(MK(d),JSON.stringify(data));
+  },[]);
+
+  // image
+  async function pickImg(file) {
+    if(!file)return;
+    try{setBusy(true);setBMsg("🖼 압축 중...");setPrev(await compressImg(file));}
+    catch(e){flash("이미지 오류","err");}
+    finally{setBusy(false);setBMsg("");}
+  }
+
+  // analyze
+  async function analyze() {
+    if(busy)return;
+    const hasP=!!prev?.b64, hasT=text.trim().length>0;
+    if(!hasP&&!hasT)return;
+    if(!apiKey){setErr("API 키가 필요합니다. ⚙️ 설정 탭에서 입력하세요.");return;}
+    setBusy(true);setBMsg(hasP?"📸 사진 분석 중...":"⚡ 영양 계산 중...");setErr(null);
+    try {
+      const prompt=mkPrompt(time,hasT?text.trim():"");
+      const content=hasP
+        ?[{type:"image",source:{type:"base64",media_type:"image/jpeg",data:prev.b64}},{type:"text",text:prompt}]
+        :prompt;
+      const raw=await callAI(content,apiKey);
+      const p=parseKV(raw);
+      const meal={id:Date.now(),time,photoUrl:prev?.url??null,
+        name:p.name,cal:p.cal,prot:p.prot,carb:p.carb,fat:p.fat,
+        items:p.items,coach:p.coach};
+      const u=[...meals,meal];setMeals(u);save(date,u);
+      setText("");setPrev(null);flash("✓ 기록 완료!");
+    }catch(e){setErr(e.message);}
+    finally{setBusy(false);setBMsg("");}
+  }
+
+  async function del(id){const u=meals.filter(m=>m.id!==id);setMeals(u);save(date,u);setOpenId(null);flash("삭제됨","warn");}
+
+  const goDay=d=>{const dt=new Date(date+"T12:00:00");dt.setDate(dt.getDate()+d);const n=fmt(dt);if(n<=TODAY())setDate(n);};
+
+  const tot=meals.reduce((a,m)=>({cal:a.cal+m.cal,prot:a.prot+m.prot,carb:a.carb+m.carb,fat:a.fat+m.fat}),{cal:0,prot:0,carb:0,fat:0});
+
+  // weekly
+  useEffect(()=>{if(tab==="week")loadWk();},[tab]);
+  function loadWk(){
+    setWkBusy(true);const o={},now=new Date();
+    for(let i=6;i>=0;i--){const d=new Date(now);d.setDate(now.getDate()-i);const ds=fmt(d);
+      const raw=LS.get(MK(ds));
+      if(raw)try{o[ds]=JSON.parse(raw).reduce((a,m)=>({cal:a.cal+m.cal,prot:a.prot+m.prot,carb:a.carb+m.carb,fat:a.fat+m.fat,n:a.n+1}),{cal:0,prot:0,carb:0,fat:0,n:0});}catch{o[ds]=null;}
+      else o[ds]=null;
+    }
+    setWk(o);setWkBusy(false);
+  }
+
+  async function wkFb(){
+    const rows=Object.entries(wk).filter(([,v])=>v);if(!rows.length)return;
+    if(!apiKey){flash("API 키가 필요합니다","err");return;}
+    setFbBusy(true);setFb("");
+    try{
+      const sum=rows.map(([d,v])=>`${d}(${DK[new Date(d+"T12:00:00").getDay()]}): ${v.cal}kcal 단${v.prot}g 탄${v.carb}g 지${v.fat}g`).join("\n");
+      const inst=`당신은 UDT 수료 목표 훈련생의 전담 영양코치입니다.
+목표: 체중 74~76kg, 체지방 9~12%, 골격근 38kg 이상.
+하루 목표: ${GOALS.cal}kcal, 단백질 ${GOALS.prot}g, 탄수화물 ${GOALS.carb}g, 지방 ${GOALS.fat}g.
+아래 주간 데이터를 분석하고 세 항목으로 답하세요.
+첫째 잘한 점:
+둘째 개선 필요:
+셋째 다음 주 전략:
+각 항목 두 문장 이내. 수치 근거 필수. 군사적 어조.
+
+${sum}`;
+      setFb(await callAI(inst,apiKey));
+    }catch(e){setFb("오류: "+e.message);}
+    finally{setFbBusy(false);}
+  }
+
+  // backup
+  function exportJSON(){
+    const o={},now=new Date();
+    for(let i=0;i<90;i++){const d=new Date(now);d.setDate(now.getDate()-i);const k=MK(fmt(d)),v=LS.get(k);if(v)o[k]=v;}
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(o,null,2)],{type:"application/json"}));
+    a.download=`udt-${TODAY()}.json`;a.click();flash("📦 백업 완료");
+  }
+  function importJSON(e){
+    const f=e.target.files[0];if(!f)return;
+    const r=new FileReader();r.onload=ev=>{
+      try{const d=JSON.parse(ev.target.result);for(const[k,v]of Object.entries(d))LS.set(k,v);
+        const raw=LS.get(MK(date));try{setMeals(raw?JSON.parse(raw):[]);}catch{setMeals([]);}
+        flash("✓ 복원 완료");}
+      catch{flash("복원 실패","err");}
+    };r.readAsText(f);e.target.value="";
+  }
+
+  // save API key
+  function saveKey(){LS.set("udt_apikey",keyInput);setApiKey(keyInput);flash("✓ API 키 저장됨!");}
+
+  const s={card:{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:16,padding:16,boxShadow:"0 1px 4px rgba(22,163,74,.06)"},
+    btn:{width:"100%",padding:16,border:"none",borderRadius:14,fontSize:16,fontWeight:800,cursor:"pointer",fontFamily:"inherit"}};
+
+  const tm=TIMES.find(t=>t.id===time)||TIMES[0];
+
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,maxWidth:430,margin:"0 auto",display:"flex",flexDirection:"column"}}>
+
+      {/* HEADER */}
+      <header style={{background:C.card,borderBottom:`1px solid ${C.bdr}`,
+        padding:`calc(env(safe-area-inset-top,0px)+14px) 18px 12px`,
+        position:"sticky",top:0,zIndex:100,boxShadow:"0 1px 6px rgba(22,163,74,.08)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end"}}>
+          <div>
+            <div style={{fontSize:9,color:C.grn,letterSpacing:4,fontWeight:800}}>UDT NUTRITION</div>
+            <div style={{fontSize:20,fontWeight:900,letterSpacing:-.3}}>작전 식단 기록</div>
+          </div>
+          <div style={{fontSize:10,color:apiKey?C.grn:C.amb,fontWeight:700}}>
+            {apiKey?"API ✓":"API 키 필요"}
+          </div>
+        </div>
+      </header>
+
+      {/* CONTENT */}
+      <main style={{flex:1,padding:"16px 14px 100px",overflowY:"auto"}}>
+
+        {/* ═══ LOG ═══ */}
+        {tab==="log"&&<>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16}}>
+            <button onClick={()=>goDay(-1)} style={{width:42,height:42,borderRadius:12,border:`1.5px solid ${C.bdr}`,background:C.card,color:C.txt,fontSize:20,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>‹</button>
+            <div style={{flex:1,textAlign:"center"}}>
+              <div style={{fontSize:16,fontWeight:800}}>{DK[new Date(date+"T12:00:00").getDay()]}요일</div>
+              <div style={{fontSize:11,color:date===TODAY()?C.grn:C.mut}}>{date===TODAY()?"오늘 · "+date:date}</div>
+            </div>
+            <button onClick={()=>goDay(1)} disabled={date===TODAY()} style={{width:42,height:42,borderRadius:12,border:`1.5px solid ${C.bdr}`,background:C.card,color:C.txt,fontSize:20,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",opacity:date===TODAY()?.3:1}}>›</button>
+          </div>
+
+          <div style={{display:"flex",gap:6,overflowX:"auto",marginBottom:14,scrollbarWidth:"none",paddingBottom:2}}>
+            {TIMES.map(t=>(
+              <button key={t.id} onClick={()=>setTime(t.id)} style={{
+                flexShrink:0,padding:"10px 13px",border:`2px solid ${time===t.id?t.c:C.bdr}`,
+                background:time===t.id?t.c:C.card,color:time===t.id?"#fff":C.sub,
+                borderRadius:12,cursor:"pointer",fontFamily:"inherit",fontSize:10,fontWeight:700,
+                letterSpacing:.5,boxShadow:time===t.id?`0 3px 10px ${t.c}44`:"0 1px 3px rgba(0,0,0,.04)",
+                transition:"all .15s",lineHeight:1.4,textAlign:"center",whiteSpace:"pre"}}>
+                {t.icon+"\n"+t.id}
+              </button>
+            ))}
+          </div>
+
+          <div style={s.card}>
+            {prev&&<div style={{position:"relative",marginBottom:12}}>
+              <img src={prev.url} alt="" style={{width:"100%",height:200,objectFit:"cover",borderRadius:12,border:`1px solid ${C.gb}`}}/>
+              <button onClick={()=>setPrev(null)} style={{position:"absolute",top:8,right:8,background:"rgba(0,0,0,.6)",border:"none",color:"#fff",width:30,height:30,borderRadius:15,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+              <div style={{position:"absolute",bottom:8,left:8,background:`${C.grn}CC`,borderRadius:8,padding:"5px 12px",fontSize:10,color:"#fff",fontWeight:700}}>📸 AI 분석 준비됨</div>
+            </div>}
+            <textarea value={text} onChange={e=>setText(e.target.value)}
+              placeholder={prev?"추가 메모 (선택)\n예) 소스 추가, 반공기만...":"음식 입력 또는 아래 카메라로 촬영\n\n예) 닭가슴살 200g, 현미밥 한 공기, 달걀 3개"}
+              style={{width:"100%",minHeight:prev?60:110,background:C.gl,border:`1.5px solid ${C.gb}`,color:C.txt,padding:14,fontFamily:"inherit",fontSize:15,lineHeight:1.7,borderRadius:12,resize:"none",boxSizing:"border-box",outline:"none"}}
+              onFocus={e=>e.target.style.borderColor=C.grn}
+              onBlur={e=>e.target.style.borderColor=C.gb}/>
+            <div style={{display:"flex",gap:8,marginTop:10}}>
+              <button onClick={()=>{camR.current.value="";camR.current.click();}} style={{flex:1,padding:"12px 0",background:C.gl,border:`1.5px solid ${C.gb}`,color:"#374151",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:600}}>📷 카메라</button>
+              <button onClick={()=>{galR.current.value="";galR.current.click();}} style={{flex:1,padding:"12px 0",background:C.gl,border:`1.5px solid ${C.gb}`,color:"#374151",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:600}}>🖼 갤러리</button>
+            </div>
+            <input ref={camR} type="file" accept="image/*" capture="environment" onChange={e=>e.target.files[0]&&pickImg(e.target.files[0])} style={{display:"none"}}/>
+            <input ref={galR} type="file" accept="image/*" onChange={e=>e.target.files[0]&&pickImg(e.target.files[0])} style={{display:"none"}}/>
+          </div>
+
+          {err&&<div style={{marginTop:10,padding:"12px 14px",background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:10,color:C.red,fontSize:12,lineHeight:1.7}}>⚠ {err}</div>}
+
+          <button onClick={analyze} disabled={busy||(!prev&&!text.trim())} style={{...s.btn,marginTop:10,background:busy?"#D1D5DB":`linear-gradient(135deg,${C.grn},#22C55E)`,color:busy?"#999":"#fff",boxShadow:busy?"none":`0 4px 20px ${C.grn}44`,opacity:busy||(!prev&&!text.trim())?.4:1}}>
+            {busy?<span style={{display:"flex",alignItems:"center",gap:8,justifyContent:"center"}}><span style={{animation:"spin 1s linear infinite",display:"inline-block"}}>◌</span>{bMsg}</span>:"⚡  AI 분석 · 기록하기"}
+          </button>
+
+          {meals.length>0&&<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:18,marginBottom:8}}>
+            <span style={{fontSize:12,color:C.sub,fontWeight:600}}>오늘 기록 <span style={{color:C.grn}}>{meals.length}건 · {tot.cal}kcal</span></span>
+          </div>}
+
+          {meals.map(m=>{
+            const tm=TIMES.find(t=>t.id===m.time)||TIMES[0];
+            const isO=openId===m.id;
+            return(
+              <div key={m.id} style={{...s.card,marginBottom:8,padding:0,overflow:"hidden",border:`1.5px solid ${isO?tm.c+"66":C.bdr}`,boxShadow:isO?`0 4px 16px ${tm.c}18`:s.card.boxShadow}}>
+                {m.photoUrl&&<img src={m.photoUrl} alt="" style={{width:"100%",height:120,objectFit:"cover",borderBottom:`1px solid ${C.bdr}`}}/>}
+                <div style={{padding:"12px 14px"}}>
+                  <div onClick={()=>setOpenId(isO?null:m.id)} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",cursor:"pointer"}}>
+                    <div style={{flex:1}}>
+                      <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6}}>
+                        <span style={{fontSize:10,padding:"2px 8px",borderRadius:12,background:`${tm.c}15`,color:tm.c,border:`1px solid ${tm.c}33`,fontWeight:700}}>{tm.icon} {m.time}</span>
+                        <span style={{fontSize:14,fontWeight:700}}>{m.name}</span>
+                      </div>
+                      <div style={{display:"flex",gap:12,fontSize:12}}>
+                        <span style={{color:C.amb,fontWeight:800}}>{m.cal}kcal</span>
+                        <span style={{color:C.sub}}>단<b style={{color:C.blu}}>{m.prot}g</b></span>
+                        <span style={{color:C.sub}}>탄<b style={{color:C.grn}}>{m.carb}g</b></span>
+                        <span style={{color:C.sub}}>지<b style={{color:C.pur}}>{m.fat}g</b></span>
+                      </div>
+                    </div>
+                    <span style={{fontSize:14,color:C.mut,paddingLeft:8,transform:isO?"rotate(180deg)":"none",transition:".2s",display:"inline-block"}}>▾</span>
+                  </div>
+                  {isO&&<div style={{marginTop:12,paddingTop:12,borderTop:`1px solid ${C.gl}`}}>
+                    {m.coach&&<div style={{padding:"10px 12px",background:C.gl,border:`1px solid ${C.gb}`,borderRadius:10,fontSize:12,color:"#15803D",lineHeight:1.6,marginBottom:10}}>💬 {m.coach}</div>}
+                    {m.items?.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:10}}>{m.items.map((it,i)=><span key={i} style={{fontSize:10,padding:"3px 8px",background:"#F3F4F6",borderRadius:6,color:C.sub}}>{it}</span>)}</div>}
+                    <button onClick={()=>del(m.id)} style={{width:"100%",padding:10,background:"#FEF2F2",border:"1px solid #FECACA",color:C.red,borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:700}}>삭제</button>
+                  </div>}
+                </div>
+              </div>
+            );
+          })}
+          {meals.length===0&&!busy&&<div style={{textAlign:"center",color:"#D1D5DB",padding:"50px 0"}}><div style={{fontSize:48,marginBottom:12}}>🥗</div><div style={{fontSize:13,lineHeight:1.8}}>시간대 선택 후<br/>음식 입력 또는 사진 촬영</div></div>}
+        </>}
+
+        {/* ═══ STATS ═══ */}
+        {tab==="stats"&&<>
+          <div style={{...s.card,textAlign:"center",padding:"28px 20px",marginBottom:12}}>
+            <div style={{fontSize:11,color:C.mut,letterSpacing:2,marginBottom:4}}>총 섭취 칼로리</div>
+            <div style={{fontSize:54,fontWeight:900,lineHeight:1,color:tot.cal>=GOALS.cal?C.grn:C.amb}}>{tot.cal.toLocaleString()}</div>
+            <div style={{fontSize:13,color:C.mut,marginTop:6}}>/ {GOALS.cal.toLocaleString()} kcal</div>
+            <div style={{marginTop:16,height:8,background:C.gl,borderRadius:4,overflow:"hidden"}}><div style={{width:pct(tot.cal,GOALS.cal)+"%",height:"100%",borderRadius:4,background:`linear-gradient(90deg,#22C55E88,${C.grn})`,transition:"width .5s ease"}}/></div>
+            <div style={{fontSize:11,color:C.mut,marginTop:8}}>{pct(tot.cal,GOALS.cal)}% 달성</div>
+          </div>
+          <div style={{...s.card,marginBottom:12}}>
+            <MacroBar label="단백질" value={tot.prot} goal={GOALS.prot} color={C.blu} unit="g"/>
+            <MacroBar label="탄수화물" value={tot.carb} goal={GOALS.carb} color={C.grn} unit="g"/>
+            <MacroBar label="지방" value={tot.fat} goal={GOALS.fat} color={C.pur} unit="g"/>
+          </div>
+          {[{l:"단백질 부족",n:GOALS.prot-tot.prot,u:"g",c:C.blu,e:"🥩"},{l:"칼로리 부족",n:GOALS.cal-tot.cal,u:"kcal",c:C.amb,e:"🍚"},{l:"탄수화물 부족",n:GOALS.carb-tot.carb,u:"g",c:C.grn,e:"🌾"}].filter(x=>x.n>0).map(x=>(<div key={x.l} style={{...s.card,marginBottom:8,padding:"14px 16px",borderLeft:`3px solid ${x.c}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:11,color:C.mut,marginBottom:4}}>{x.l}</div><div style={{fontSize:24,fontWeight:900,color:x.c}}>{Math.round(x.n)}<span style={{fontSize:12,marginLeft:2}}>{x.u}</span></div></div><span style={{fontSize:28}}>{x.e}</span></div>))}
+        </>}
+
+        {/* ═══ WEEK ═══ */}
+        {tab==="week"&&<>{wkBusy?<div style={{textAlign:"center",color:C.mut,padding:40}}>불러오는 중...</div>:<>
+          <div style={{display:"flex",gap:4,marginBottom:16,overflowX:"auto",scrollbarWidth:"none"}}>
+            {Object.entries(wk).map(([d,v])=>{const isT=d===TODAY();return(<div key={d} onClick={()=>{setDate(d);setTab("log");}} style={{flex:"0 0 auto",width:44,padding:"8px 0",background:isT?C.gl:"#FAFAFA",border:`1.5px solid ${isT?C.grn:v?C.gb:C.bdr}`,borderRadius:12,textAlign:"center",cursor:"pointer"}}><div style={{fontSize:9,color:C.mut,marginBottom:3}}>{DK[new Date(d+"T12:00:00").getDay()]}</div><div style={{fontSize:12,fontWeight:700,color:isT?C.grn:v?C.txt:"#D1D5DB",marginBottom:5}}>{d.slice(8)}</div><div style={{height:3,background:"#E5E7EB",borderRadius:2,overflow:"hidden",margin:"0 6px"}}>{v&&<div style={{width:`${pct(v.cal,GOALS.cal)}%`,height:"100%",background:"#22C55E"}}/>}</div></div>);})}
+          </div>
+          {Object.entries(wk).map(([d,v])=>{const isT=d===TODAY();return(<div key={d} onClick={()=>{setDate(d);setTab("log");}} style={{...s.card,marginBottom:8,padding:"14px 16px",cursor:"pointer",border:`1.5px solid ${isT?"#22C55E":C.bdr}`,background:isT?C.gl:C.card}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:v?10:0}}><div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:14,fontWeight:800}}>{DK[new Date(d+"T12:00:00").getDay()]}</span><span style={{fontSize:11,color:C.mut}}>{d.slice(5)}</span>{isT&&<span style={{fontSize:9,padding:"2px 8px",borderRadius:12,background:C.gl,color:C.grn,border:`1px solid ${C.gb}`,fontWeight:700}}>오늘</span>}</div>{v?<span style={{fontSize:13,color:C.amb,fontWeight:800}}>{v.cal}kcal</span>:<span style={{fontSize:11,color:"#D1D5DB"}}>미기록</span>}</div>{v&&<><div style={{display:"flex",gap:3,marginBottom:6}}>{[["cal","#F59E0B"],["prot","#3B82F6"],["carb","#22C55E"],["fat","#A855F7"]].map(([k,c])=>(<div key={k} style={{flex:1,height:5,background:"#F3F4F6",borderRadius:3,overflow:"hidden"}}><div style={{width:`${pct(v[k],GOALS[k==="cal"?"cal":k])}%`,height:"100%",background:c}}/></div>))}</div><div style={{display:"flex",gap:12,fontSize:11,color:C.mut}}><span>단<b style={{color:"#3B82F6"}}>{v.prot}g</b></span><span>탄<b style={{color:"#22C55E"}}>{v.carb}g</b></span><span>지<b style={{color:"#A855F7"}}>{v.fat}g</b></span><span>{v.n}끼</span></div></>}</div>);})}
+          {(()=>{const arr=Object.values(wk).filter(Boolean);if(!arr.length)return null;const avg={cal:Math.round(arr.reduce((s,d)=>s+d.cal,0)/arr.length),prot:Math.round(arr.reduce((s,d)=>s+d.prot,0)/arr.length),carb:Math.round(arr.reduce((s,d)=>s+d.carb,0)/arr.length),fat:Math.round(arr.reduce((s,d)=>s+d.fat,0)/arr.length)};return(<div style={{...s.card,border:`1.5px solid ${C.gb}`,background:C.gl,marginTop:4,padding:16}}><div style={{fontSize:10,color:C.grn,letterSpacing:2,fontWeight:700,marginBottom:12}}>주간 일평균</div><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px 20px"}}>{[["칼로리",avg.cal,GOALS.cal,"kcal",C.amb],["단백질",avg.prot,GOALS.prot,"g",C.blu],["탄수화물",avg.carb,GOALS.carb,"g",C.grn],["지방",avg.fat,GOALS.fat,"g",C.pur]].map(([l,v,g,u,c])=>(<div key={l}><div style={{fontSize:10,color:C.mut,marginBottom:2}}>{l}</div><div style={{fontSize:20,fontWeight:900,color:c}}>{v}<span style={{fontSize:11,color:C.mut}}>{u}</span></div><div style={{fontSize:10,color:pct(v,g)>=80?C.grn:C.amb}}>목표 {pct(v,g)}%</div></div>))}</div><div style={{marginTop:10,fontSize:11,color:C.mut}}>기록 <b style={{color:C.grn}}>{arr.length}</b>/7일</div></div>);})()}
+          <button onClick={wkFb} disabled={fbBusy} style={{...s.btn,marginTop:12,background:fbBusy?"#D1D5DB":`linear-gradient(135deg,#059669,${C.grn})`,color:fbBusy?"#999":"#fff",boxShadow:fbBusy?"none":`0 4px 16px ${C.grn}44`,opacity:fbBusy?.6:1}}>{fbBusy?"분석 중...":"⚡ AI 주간 코칭 리포트"}</button>
+          {fb&&<div style={{...s.card,marginTop:10,border:`1.5px solid ${C.gb}`,background:C.gl,fontSize:13,lineHeight:1.9,color:"#166534",whiteSpace:"pre-wrap"}}><div style={{fontSize:10,color:C.grn,fontWeight:700,letterSpacing:2,marginBottom:10}}>AI 코치 주간 리포트</div>{fb}</div>}
+        </>}</>}
+
+        {/* ═══ SETTINGS ═══ */}
+        {tab==="settings"&&<>
+          {/* API Key */}
+          <div style={{...s.card,marginBottom:12,border:`1.5px solid ${apiKey?C.gb:"#FCD34D"}`,background:apiKey?C.gl:"#FFFBEB"}}>
+            <div style={{fontSize:12,fontWeight:700,color:apiKey?C.grn:C.amb,marginBottom:8}}>
+              {apiKey?"✅ API 키 설정됨":"⚠️ API 키 필요"}
+            </div>
+            <div style={{fontSize:12,color:C.sub,lineHeight:1.7,marginBottom:12}}>
+              AI 분석 기능 사용을 위해 Anthropic API 키가 필요합니다.<br/>
+              <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" style={{color:C.blu,textDecoration:"underline"}}>
+                console.anthropic.com</a>에서 발급받으세요.
+            </div>
+            <input type="password" value={keyInput} onChange={e=>setKeyInput(e.target.value)}
+              placeholder="sk-ant-api03-... 형식의 키 입력"
+              style={{width:"100%",padding:"12px 14px",border:`1.5px solid ${C.bdr}`,borderRadius:10,fontSize:14,fontFamily:"inherit",background:C.card,color:C.txt,boxSizing:"border-box",outline:"none",marginBottom:8}}
+              onFocus={e=>e.target.style.borderColor=C.grn}
+              onBlur={e=>e.target.style.borderColor=C.bdr}/>
+            <button onClick={saveKey} style={{width:"100%",padding:12,background:C.grn,border:"none",color:"#fff",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>키 저장</button>
+          </div>
+
+          {/* Goals */}
+          <div style={{...s.card,marginBottom:12}}>
+            <div style={{fontSize:11,color:C.sub,fontWeight:700,letterSpacing:1,marginBottom:12}}>나의 목표</div>
+            {[["현재 체중","72 kg"],["목표 체중","74~76 kg"],["목표 체지방","9~12 %"],["목표 골격근","38 kg 이상"]].map(([l,v])=>(<div key={l} style={{display:"flex",justifyContent:"space-between",padding:"11px 0",borderBottom:`1px solid ${C.gl}`}}><span style={{fontSize:13,color:C.sub}}>{l}</span><span style={{fontSize:13,fontWeight:700}}>{v}</span></div>))}
+          </div>
+          <div style={{...s.card,marginBottom:12}}>
+            <div style={{fontSize:11,color:C.sub,fontWeight:700,letterSpacing:1,marginBottom:12}}>하루 영양 목표</div>
+            {[["칼로리",GOALS.cal+" kcal",C.amb],["단백질",GOALS.prot+" g",C.blu],["탄수화물",GOALS.carb+" g",C.grn],["지방",GOALS.fat+" g",C.pur]].map(([l,v,c])=>(<div key={l} style={{display:"flex",justifyContent:"space-between",padding:"11px 0",borderBottom:`1px solid ${C.gl}`}}><span style={{fontSize:13,color:C.sub}}>{l}</span><span style={{fontSize:14,fontWeight:800,color:c}}>{v}</span></div>))}
+          </div>
+
+          {/* Backup */}
+          <div style={{...s.card,marginBottom:12,border:"1.5px solid #FEF3C7"}}>
+            <div style={{fontSize:11,color:C.sub,fontWeight:700,letterSpacing:1,marginBottom:10}}>데이터 백업 · 복원</div>
+            <button onClick={exportJSON} style={{width:"100%",padding:14,marginBottom:8,background:"#FFFBEB",border:"1.5px solid #FCD34D",color:"#92400E",borderRadius:12,fontFamily:"inherit",fontSize:14,fontWeight:700,cursor:"pointer"}}>📦 데이터 내보내기</button>
+            <label style={{display:"block",width:"100%",padding:14,background:"#EFF6FF",border:"1.5px solid #BFDBFE",color:"#1E40AF",borderRadius:12,fontFamily:"inherit",fontSize:14,fontWeight:700,cursor:"pointer",textAlign:"center",boxSizing:"border-box"}}>📂 백업에서 복원<input type="file" accept=".json" onChange={importJSON} style={{display:"none"}}/></label>
+          </div>
+        </>}
+      </main>
+
+      {/* TAB BAR */}
+      <nav style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,background:C.card,borderTop:`1px solid ${C.bdr}`,display:"flex",zIndex:200,paddingBottom:"env(safe-area-inset-bottom,0px)",boxShadow:"0 -2px 10px rgba(0,0,0,.06)"}}>
+        {[["log","✏️","입력"],["stats","📊","오늘"],["week","📅","주간"],["settings","⚙️","설정"]].map(([id,icon,label])=>(
+          <button key={id} onClick={()=>setTab(id)} style={{flex:1,padding:"10px 0 8px",background:"none",border:"none",color:tab===id?C.grn:C.mut,cursor:"pointer",fontFamily:"inherit",display:"flex",flexDirection:"column",alignItems:"center",gap:2,paddingBottom:`calc(8px + env(safe-area-inset-bottom,0px))`}}>
+            <span style={{fontSize:22,lineHeight:1}}>{icon}</span>
+            <span style={{fontSize:9,fontWeight:tab===id?700:400}}>{label}</span>
+            {tab===id&&<div style={{width:20,height:2.5,background:C.grn,borderRadius:2,marginTop:1}}/>}
+          </button>
+        ))}
+      </nav>
+
+      {toast&&<div style={{position:"fixed",bottom:88,left:"50%",transform:"translateX(-50%)",background:toast.t==="err"?"#FEF2F2":toast.t==="warn"?"#FFFBEB":C.gl,border:`1px solid ${toast.t==="err"?"#FECACA":toast.t==="warn"?"#FCD34D":C.gb}`,color:toast.t==="err"?C.red:toast.t==="warn"?"#92400E":"#15803D",padding:"10px 20px",borderRadius:24,fontSize:13,fontWeight:700,zIndex:999,whiteSpace:"nowrap",animation:"slideUp .25s ease",boxShadow:"0 4px 16px rgba(0,0,0,.1)"}}>{toast.msg}</div>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
